@@ -39,6 +39,7 @@ the JDK, for the small exporters that call Mojang's own code. Release folders sh
 cargo run --release -p horizon-prepare -- --prepare --server-jar ~/Downloads/server.jar
 cargo run --release -p horizon-prepare -- sounds
 cargo run --release -p horizon-client -- --render-distance 12
+cargo run --release -p horizon-client -- --vr
 ```
 
 Development builds that link quickly: `cargo build --profile fast -p horizon-client`.
@@ -50,6 +51,12 @@ Development builds that link quickly: `cargo build --profile fast -p horizon-cli
 | `--creative` | Creative mode (instant breaking, pick block) |
 | `--render-distance N` | Chunks, 2..64 (default 12) |
 | `--resources PATH` | Prepared resource directory |
+| `--vr` | Start stereo rendering through the installed OpenXR runtime (Vulkan required) |
+
+The initial VR path uses OpenXR head tracking for stereo rendering, camera
+position, and aiming. It still uses Horizon's desktop keyboard and mouse
+controls; OpenXR controller input and controller-tracked hands are not wired up
+yet. Start the OpenXR runtime before launching Horizon.
 
 | Control | Action |
 | --- | --- |

@@ -312,6 +312,8 @@ struct Options {
     /// Render into a texture instead of the window (`--offscreen`), so a
     /// GPU the display cannot present from can still be benchmarked.
     offscreen: bool,
+    /// Start through the system OpenXR runtime and render stereo frames.
+    vr: bool,
     /// `--width` and `--height` (vanilla's own arguments): the window's
     /// starting size, 1280x720 by default.
     window_size: [u32; 2],
@@ -374,6 +376,7 @@ impl Options {
             no_pause: false,
             control: None,
             offscreen: false,
+            vr: false,
             window_size: [1280, 720],
             spikes: std::env::var("HORIZON_SPIKES")
                 .ok()
@@ -394,7 +397,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..64 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --dev-mod PATH          A Horizon mod (.hmod or folder) to develop: always on, reloaded when rebuilt\n  --in-frame              Run single player's world in the frame, not on its server thread\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..64 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --vr                    Start stereo VR through the system OpenXR runtime (Vulkan)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --dev-mod PATH          A Horizon mod (.hmod or folder) to develop: always on, reloaded when rebuilt\n  --in-frame              Run single player's world in the frame, not on its server thread\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
                     );
                     return Ok(None);
@@ -408,6 +411,7 @@ impl Options {
                 "--test-terrain" => o.test_terrain = true,
                 "--no-pause" => o.no_pause = true,
                 "--offscreen" => o.offscreen = true,
+                "--vr" => o.vr = true,
                 "--control" => o.control = Some(horizon_client::control::default_path()),
                 "--server-thread" => o.server_thread = true,
                 "--in-frame" | "--no-server-thread" => o.server_thread = false,
@@ -2070,7 +2074,26 @@ impl Game<'_> {
     /// crosshair target (blocks, fluids, entities, mod raycasts) is found
     /// along this ray, so a tracked controller can stand in for it.
     fn aim(&self) -> Option<([f64; 3], [f64; 3])> {
-        Some((self.eye_position()?, view_vector(self.yaw, self.pitch)))
+        let mut eye = self.eye_position()?;
+        let (yaw, pitch) =
+            if let Some(pose) = self.renderer.as_ref().and_then(Renderer::xr_head_pose) {
+                let body = horizon_client::camera::view_matrix(self.yaw, self.pitch)
+                    .inverse()
+                    .to_scale_rotation_translation()
+                    .1;
+                let direction = body * pose.rotation * glam::Vec3::NEG_Z;
+                let offset = body * pose.translation;
+                eye[0] += f64::from(offset.x);
+                eye[1] += f64::from(offset.y);
+                eye[2] += f64::from(offset.z);
+                (
+                    (-direction.x).atan2(direction.z).to_degrees(),
+                    -direction.y.clamp(-1.0, 1.0).asin().to_degrees(),
+                )
+            } else {
+                (self.yaw, self.pitch)
+            };
+        Some((eye, view_vector(yaw, pitch)))
     }
     fn reach(&self) -> f64 {
         if self.creative { 5.0 } else { 4.5 }
@@ -10875,6 +10898,7 @@ impl Game<'_> {
             self.renderer.as_ref(),
             None,
             self.settings.horizon.api,
+            self.options.vr,
         )
     }
     fn apply_settings(&mut self) {
@@ -11749,12 +11773,18 @@ impl Game<'_> {
         else {
             return Ok(false);
         };
+        let xr_head_pose = self
+            .renderer
+            .as_mut()
+            .map(Renderer::prepare_xr_frame)
+            .transpose()?
+            .flatten();
         let alpha = self.clock.fraction();
         // Camera.getCameraEntityPartialTicks: the view, the hand and the
         // player's own model stay smooth while the level is frozen.
         let camera_alpha = self.clock.camera_fraction();
         let view = self.camera_view(camera_alpha as f32);
-        let (camera, underwater, view_yaw, view_pitch) = match view {
+        let (mut camera, underwater, view_yaw, view_pitch) = match view {
             Some((c, yaw, pitch)) => {
                 let s =
                     self.world
@@ -11767,6 +11797,25 @@ impl Game<'_> {
                 self.yaw,
                 self.pitch,
             ),
+        };
+        let (view_yaw, view_pitch) = if let Some(pose) = xr_head_pose {
+            let body = horizon_client::camera::view_matrix(view_yaw, view_pitch)
+                .inverse()
+                .to_scale_rotation_translation()
+                .1;
+            let direction = body * pose.rotation * glam::Vec3::NEG_Z;
+            let offset = body * pose.translation;
+            camera += glam::DVec3::new(
+                f64::from(offset.x),
+                f64::from(offset.y),
+                f64::from(offset.z),
+            );
+            (
+                (-direction.x).atan2(direction.z).to_degrees(),
+                -direction.y.clamp(-1.0, 1.0).asin().to_degrees(),
+            )
+        } else {
+            (view_yaw, view_pitch)
         };
         let (view_yaw, view_pitch) = self.shaken_view(view_yaw, view_pitch);
         self.audio
@@ -14890,6 +14939,7 @@ fn build_renderer(
     previous: Option<&Renderer>,
     prepared: Option<horizon_client::gfx::PreparedTextures>,
     api: horizon_client::graphics::GraphicsApi,
+    vr_enabled: bool,
 ) -> Result<Renderer> {
     let assets = &pack.render;
     let atlas = &gui.atlas;
@@ -14922,6 +14972,7 @@ fn build_renderer(
         prepared,
         previous,
         api,
+        vr_enabled,
     ))?;
     renderer.hud.sprite_animations = atlas
         .sprite_animations
@@ -14940,6 +14991,7 @@ fn loading_renderer(
     gui: Option<&UiResources>,
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
+    vr_enabled: bool,
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
@@ -14981,6 +15033,7 @@ fn loading_renderer(
         None,
         previous,
         api,
+        vr_enabled,
     ))?;
     if let Some(atlas) = atlas {
         renderer.hud.sprite_animations = atlas
@@ -15301,6 +15354,7 @@ impl Loading {
             self.gui.as_ref(),
             None,
             self.settings.horizon.api,
+            self.options.as_ref().is_some_and(|options| options.vr),
         ) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
@@ -15345,6 +15399,7 @@ impl Loading {
             self.gui.as_ref(),
             self.renderer.as_ref(),
             self.settings.horizon.api,
+            self.options.as_ref().is_some_and(|options| options.vr),
         ) {
             Ok(r) => {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
@@ -15427,6 +15482,7 @@ impl Loading {
             self.renderer.as_ref(),
             loaded.renderer_cpu,
             self.settings.horizon.api,
+            options.vr,
         )?;
         log::info!(
             "Horizon: world renderer ready after {} ms",

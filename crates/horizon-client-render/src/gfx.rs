@@ -10,7 +10,7 @@ use crate::{
     sprites::SpriteAnimation,
 };
 use glam::{DVec3, Mat4, Vec3, Vec4};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -350,6 +350,11 @@ struct BorderUniform {
     offset: [f32; 4],
 }
 pub struct Renderer {
+    /// OpenXR swapchain wrappers are dropped before their session and device.
+    xr_images: Vec<Option<wgpu::Texture>>,
+    xr_frame: Option<horizon_xr::XrFrame>,
+    xr_head_pose: Option<horizon_xr::XrHeadPose>,
+    xr_session: Option<Rc<RefCell<horizon_xr::XrSession>>>,
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     /// The window's swapchain; `None` when rendering offscreen (`--offscreen`).
@@ -581,7 +586,17 @@ pub struct Renderer {
     /// Advance animated block textures (Horizon setting; vanilla always does).
     pub animated_textures: bool,
     present_modes: Vec<wgpu::PresentMode>,
+    /// Keeps OpenXR alive until its Vulkan instance and device wrappers drop.
+    xr_graphics: Option<Rc<horizon_xr::XrGraphics>>,
 }
+
+#[derive(Clone, Copy)]
+struct XrRenderTarget<'a> {
+    texture: &'a wgpu::Texture,
+    layer: u32,
+    matrices: horizon_xr::XrEyeMatrices,
+}
+
 /// Every layer's mip levels, layer major (`first` is the first layer's
 /// index into `settings`), made by `MipmapGenerator`.
 /// Block sprite layers per texture array: the smallest
@@ -829,6 +844,8 @@ fn backends_name(backends: wgpu::Backends) -> &'static str {
 }
 /// A device and what it came from.
 struct Opened {
+    xr_graphics: Option<Rc<horizon_xr::XrGraphics>>,
+    xr_session: Option<Rc<RefCell<horizon_xr::XrSession>>>,
     instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
     adapter: wgpu::Adapter,
@@ -899,7 +916,11 @@ async fn open_device(
     offscreen: bool,
     api: GraphicsApi,
     layers: u32,
+    xr_enabled: bool,
 ) -> Result<Opened> {
+    if xr_enabled {
+        return open_xr_device(layers);
+    }
     let order = backend_order(
         api.with_env(),
         std::env::consts::OS,
@@ -989,6 +1010,8 @@ async fn open_device(
         match opened {
             Ok((device, queue)) => {
                 return Ok(Opened {
+                    xr_graphics: None,
+                    xr_session: None,
                     instance,
                     surface,
                     adapter,
@@ -1000,6 +1023,52 @@ async fn open_device(
         }
     }
     Err(format!("{NO_GPU_DRIVER} ({})", failures.join("; ")).into())
+}
+
+fn open_xr_device(layers: u32) -> Result<Opened> {
+    let xr_graphics =
+        Rc::new(horizon_xr::XrGraphics::new().map_err(|error| format!("OpenXR: {error}"))?);
+    let instance = xr_graphics.instance().clone();
+    let adapter = xr_graphics.adapter().clone();
+    describe_adapter(&adapter);
+    check_layers(&adapter.limits(), layers)?;
+    let features = timing::GpuTimer::features(&adapter)
+        | cull::Cull::features(&adapter)
+        | (adapter.features()
+            & (wgpu::Features::INDIRECT_FIRST_INSTANCE
+                | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+                | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+                | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                | wgpu::Features::RG11B10UFLOAT_RENDERABLE));
+    let limits = adapter.limits();
+    let driver = adapter.get_info();
+    startup_step(format_args!(
+        "requesting an OpenXR Vulkan device ({}, {}) with features [{features}]",
+        driver.driver, driver.driver_info
+    ));
+    let desc = wgpu::DeviceDescriptor {
+        label: Some("Horizon OpenXR device"),
+        required_features: features,
+        required_limits: limits,
+        ..Default::default()
+    };
+    let (device, queue) = xr_graphics
+        .open_device(&desc)
+        .map_err(|error| format!("OpenXR: {error}"))?;
+    let xr_session = Rc::new(RefCell::new(
+        xr_graphics
+            .create_session(&device)
+            .map_err(|error| format!("OpenXR: {error}"))?,
+    ));
+    Ok(Opened {
+        xr_graphics: Some(xr_graphics),
+        xr_session: Some(xr_session),
+        instance,
+        surface: None,
+        adapter,
+        device,
+        queue,
+    })
 }
 /// What to tell a player whose system offers no usable graphics adapter.
 /// Vulkan is loaded at run time (the game links no graphics library), so a
@@ -1074,6 +1143,7 @@ impl Renderer {
         prepared: Option<PreparedTextures>,
         previous: Option<&Self>,
         api: GraphicsApi,
+        xr_enabled: bool,
     ) -> Result<Self> {
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
@@ -1084,6 +1154,8 @@ impl Renderer {
             .into());
         }
         let Opened {
+            xr_graphics,
+            xr_session,
             instance,
             surface,
             adapter,
@@ -1096,8 +1168,15 @@ impl Renderer {
             Some(renderer) => {
                 describe_adapter(&renderer.adapter);
                 check_layers(&renderer.adapter.limits(), layers)?;
+                if renderer.xr_session.is_some() != xr_enabled {
+                    return Err(
+                        "the renderer cannot change VR mode during a resource reload".into(),
+                    );
+                }
                 Opened {
-                    surface: if offscreen {
+                    xr_graphics: renderer.xr_graphics.clone(),
+                    xr_session: renderer.xr_session.clone(),
+                    surface: if offscreen || renderer.xr_session.is_some() {
                         None
                     } else {
                         let spare = renderer
@@ -1116,11 +1195,16 @@ impl Renderer {
                     queue: renderer.queue.clone(),
                 }
             }
-            None => open_device(&window, offscreen, api, layers).await?,
+            None => open_device(&window, offscreen, api, layers, xr_enabled).await?,
         };
         let info = adapter.get_info();
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
-        let size = window.inner_size();
+        let mut size = window.inner_size();
+        if let Some(xr) = &xr_session {
+            let view_size = xr.borrow().size();
+            size.width = view_size[0];
+            size.height = view_size[1];
+        }
         let (config, present_modes, hdr_output) = if let Some(surface) = &surface {
             let mut config = surface
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -1151,9 +1235,16 @@ impl Renderer {
             surface.configure(&device, &config);
             (config, caps.present_modes.clone(), hdr::output(&caps))
         } else {
-            let format = wgpu::TextureFormat::Bgra8Unorm;
+            let format = xr_session
+                .as_ref()
+                .map_or(wgpu::TextureFormat::Bgra8Unorm, |xr| xr.borrow().format());
             let config = wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | if xr_session.is_none() {
+                        wgpu::TextureUsages::COPY_SRC
+                    } else {
+                        wgpu::TextureUsages::empty()
+                    },
                 format,
                 width: size.width.max(1),
                 height: size.height.max(1),
@@ -1165,8 +1256,7 @@ impl Renderer {
             };
             (config, Vec::new(), None)
         };
-        let offscreen = surface
-            .is_none()
+        let offscreen = (surface.is_none() && xr_session.is_none())
             .then(|| Self::offscreen_target(&device, &config));
         if previous.is_none() {
             startup_step(format_args!("creating the pipelines"));
@@ -2539,7 +2629,22 @@ impl Renderer {
                 on_off(gpu_timer.is_some()),
             ));
         }
+        let xr_images = xr_session
+            .as_ref()
+            .map(|xr| {
+                xr.borrow()
+                    .import_images(&device)
+                    .map_err(|error| format!("OpenXR: {error}"))
+                    .map(|images| images.into_iter().map(Some).collect())
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
+            xr_images,
+            xr_frame: None,
+            xr_head_pose: None,
+            xr_session,
+            xr_graphics,
             instance,
             adapter,
             surface,
@@ -2750,7 +2855,7 @@ impl Renderer {
     }
     /// Reattach a window after surface loss or a failed renderer replacement.
     pub fn recreate_surface(&mut self) -> Result<()> {
-        if self.offscreen.is_some() {
+        if self.offscreen.is_some() || self.xr_session.is_some() {
             return Ok(());
         }
         // The surface set aside for a replacement that failed, else a new one
@@ -2843,6 +2948,10 @@ impl Renderer {
         }
     }
     pub fn resize(&mut self, width: u32, height: u32) {
+        if self.xr_session.is_some() {
+            self.suspended = false;
+            return;
+        }
         self.suspended = width == 0 || height == 0;
         if self.suspended {
             return;
@@ -3555,15 +3664,107 @@ impl Renderer {
             );
         }
     }
+    /// Waits for the OpenXR display frame so gameplay can use the same tracked
+    /// head pose that the renderer will submit.
+    pub fn prepare_xr_frame(&mut self) -> Result<Option<horizon_xr::XrHeadPose>> {
+        let Some(session) = self.xr_session.as_ref().cloned() else {
+            return Ok(None);
+        };
+        if self.xr_frame.is_none() {
+            let mut session = session.borrow_mut();
+            let frame = session
+                .begin_frame()
+                .map_err(|error| format!("OpenXR: {error}"))?;
+            self.xr_head_pose = frame.as_ref().and_then(|frame| session.head_pose(frame));
+            self.xr_frame = frame;
+        }
+        Ok(self.xr_head_pose)
+    }
+    pub fn xr_head_pose(&self) -> Option<horizon_xr::XrHeadPose> {
+        self.xr_head_pose
+    }
     pub fn render(&mut self, frame: &Frame) -> Result<bool> {
-        let rendered = self.draw_frame(frame);
+        let rendered = if self.xr_session.is_some() {
+            self.render_xr(frame)
+        } else {
+            self.draw_frame(frame, None)
+        };
         // A frame that was not drawn still submits the section copies.
         if let Some(copies) = self.take_section_copies() {
             self.queue.submit([copies]);
         }
         rendered
     }
-    fn draw_frame(&mut self, frame: &Frame) -> Result<bool> {
+    fn render_xr(&mut self, frame: &Frame) -> Result<bool> {
+        let session = self.xr_session.as_ref().unwrap().clone();
+        self.prepare_xr_frame()?;
+        let xr_frame = self.xr_frame.take();
+        let Some(xr_frame) = xr_frame else {
+            return Ok(false);
+        };
+        if !xr_frame.should_render {
+            session
+                .borrow_mut()
+                .end_frame(xr_frame, false)
+                .map_err(|error| format!("OpenXR: {error}"))?;
+            return Ok(false);
+        }
+        let base_view = crate::camera::view_matrix(frame.yaw, frame.pitch);
+        let matrices = session
+            .borrow_mut()
+            .eye_matrices(&xr_frame, base_view, frame.depth_far);
+        let Some(matrices) = matrices else {
+            session
+                .borrow_mut()
+                .end_frame(xr_frame, false)
+                .map_err(|error| format!("OpenXR: {error}"))?;
+            return Ok(false);
+        };
+        let Some(image_index) = xr_frame.image_index.map(|index| index as usize) else {
+            session
+                .borrow_mut()
+                .end_frame(xr_frame, false)
+                .map_err(|error| format!("OpenXR: {error}"))?;
+            return Err("OpenXR rendered a frame without acquiring its swapchain image".into());
+        };
+        let Some(texture) = self.xr_images.get_mut(image_index).and_then(Option::take) else {
+            session
+                .borrow_mut()
+                .end_frame(xr_frame, false)
+                .map_err(|error| format!("OpenXR: {error}"))?;
+            return Err("OpenXR swapchain image was not imported".into());
+        };
+        let render_result = (|| {
+            for (layer, matrices) in matrices.into_iter().enumerate() {
+                if !self.draw_frame(
+                    frame,
+                    Some(XrRenderTarget {
+                        texture: &texture,
+                        layer: layer as u32,
+                        matrices,
+                    }),
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        // The runtime can recycle this image as soon as end_frame releases it.
+        // Finish both eye submissions before giving the image back.
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        self.xr_images[image_index] = Some(texture);
+        let submitted = render_result.as_ref().is_ok_and(|rendered| *rendered);
+        let end_result = session
+            .borrow_mut()
+            .end_frame(xr_frame, submitted)
+            .map_err(|error| format!("OpenXR: {error}"));
+        end_result?;
+        render_result
+    }
+    fn draw_frame(&mut self, frame: &Frame, xr_target: Option<XrRenderTarget<'_>>) -> Result<bool> {
         self.arena.trim();
         self.sorted_indices.trim();
         if let Some(flat) = &mut self.flat {
@@ -3579,7 +3780,10 @@ impl Renderer {
             self.first_frame = FirstFrame::Submit;
         }
         let acquire = Instant::now();
-        let acquired = self.surface.as_ref().map(|s| s.get_current_texture());
+        let acquired = xr_target
+            .is_none()
+            .then(|| self.surface.as_ref().map(|s| s.get_current_texture()))
+            .flatten();
         self.last_wait = acquire.elapsed();
         let (surface_frame, reconfigure) = match acquired {
             None => (None, false),
@@ -3608,10 +3812,14 @@ impl Renderer {
             }
         };
         let size = [self.config.width, self.config.height];
-        let target_texture = match (&surface_frame, &mut self.hdr) {
-            (Some(_), Some(hdr)) => hdr.frame(&self.device, size),
-            (Some(f), None) => f.texture.clone(),
-            (None, _) => self.offscreen.clone().ok_or("no offscreen target")?,
+        let target_texture = if let Some(target) = xr_target {
+            target.texture.clone()
+        } else {
+            match (&surface_frame, &mut self.hdr) {
+                (Some(_), Some(hdr)) => hdr.frame(&self.device, size),
+                (Some(f), None) => f.texture.clone(),
+                (None, _) => self.offscreen.clone().ok_or("no offscreen target")?,
+            }
         };
         // One command buffer for the frame, after the section copies staged
         // since the last one: Metal commits every command buffer wgpu-core
@@ -3638,17 +3846,25 @@ impl Renderer {
             frame.block_flicker,
             frame.boss_darken,
         );
-        let view_proj = self.view_projection(frame);
+        let view_proj = xr_target.map_or_else(
+            || self.view_projection(frame),
+            |target| target.matrices.projection * target.matrices.view,
+        );
         // TAA runs where the world post pass does, not under a shader pack's own.
-        let taa = !frame.title
+        let taa = xr_target.is_none()
+            && !frame.title
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
             && self.native.as_ref().is_none_or(|n| n.post.is_none());
-        let jittered = self.world_post.jitter(
-            [self.config.width, self.config.height],
-            taa,
-            view_proj,
-            frame.camera,
-        ) * view_proj;
+        let jittered = if xr_target.is_some() {
+            view_proj
+        } else {
+            self.world_post.jitter(
+                [self.config.width, self.config.height],
+                taa,
+                view_proj,
+                frame.camera,
+            ) * view_proj
+        };
         if frame.title {
             self.panorama.prepare(
                 &self.queue,
@@ -3659,7 +3875,10 @@ impl Renderer {
             );
         }
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let view = crate::camera::view_matrix(frame.yaw, frame.pitch);
+        let view = xr_target.map_or_else(
+            || crate::camera::view_matrix(frame.yaw, frame.pitch),
+            |target| target.matrices.view,
+        );
         let sun_angle = frame.sky.sun_angle.to_radians();
         // Celestial bodies rotate around the X axis; angle 0 = noon.
         let sun = Vec3::new(0.0, sun_angle.cos(), -sun_angle.sin());
@@ -4487,6 +4706,9 @@ impl Renderer {
         }
         let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.config.format.remove_srgb_suffix()),
+            dimension: xr_target.map(|_| wgpu::TextureViewDimension::D2),
+            base_array_layer: xr_target.map_or(0, |target| target.layer),
+            array_layer_count: xr_target.map(|_| 1),
             ..Default::default()
         });
         if let Some(timer) = &mut self.gpu_timer {
@@ -5180,9 +5402,9 @@ impl Renderer {
             let first = debug_depth + debug_top;
             pass.draw(0..4, first..first + crosshair);
         }
-        let menu_blur = frame
-            .menu_blur
-            .filter(|_| self.config.usage.contains(wgpu::TextureUsages::COPY_SRC));
+        let menu_blur = frame.menu_blur.filter(|_| {
+            xr_target.is_none() && self.config.usage.contains(wgpu::TextureUsages::COPY_SRC)
+        });
         let blur_at = menu_blur.map_or(0, |_| frame.hud.blur_at);
         self.hud.draw_range(
             &mut encoder,
@@ -5225,19 +5447,23 @@ impl Renderer {
                 (&view_target, self.config.format.remove_srgb_suffix()),
             );
         }
-        let readback = self.screenshot.take().and_then(|path| {
-            // The copy and PNG writer both assume 8-bit pixels; a float surface would make
-            // the row stride too small for the copy and abort in validation.
-            if self.config.format.block_copy_size(None) == Some(4) {
-                Some((path, self.copy_frame(&mut encoder, &target_texture)))
-            } else {
-                self.screenshot_result = Some(Err(format!(
-                    "screenshots need a 32-bit surface format, not {:?}",
-                    self.config.format
-                )));
-                None
-            }
-        });
+        let readback = xr_target
+            .is_none()
+            .then(|| self.screenshot.take())
+            .flatten()
+            .and_then(|path| {
+                // The copy and PNG writer both assume 8-bit pixels; a float surface would make
+                // the row stride too small for the copy and abort in validation.
+                if self.config.format.block_copy_size(None) == Some(4) {
+                    Some((path, self.copy_frame(&mut encoder, &target_texture)))
+                } else {
+                    self.screenshot_result = Some(Err(format!(
+                        "screenshots need a 32-bit surface format, not {:?}",
+                        self.config.format
+                    )));
+                    None
+                }
+            });
         self.uploads.finish(&encoder);
         if has_section_copies {
             self.section_copy_bytes = 0;
