@@ -11881,7 +11881,7 @@ impl Game<'_> {
         } else {
             (view_yaw, view_pitch)
         };
-        let (view_yaw, view_pitch) = if xr_head_pose.is_some() {
+        let (view_yaw, view_pitch) = if self.options.vr {
             (view_yaw, view_pitch)
         } else {
             self.shaken_view(view_yaw, view_pitch)
@@ -12055,12 +12055,12 @@ impl Game<'_> {
         };
         self.locator_camera =
             (!title).then_some((camera.to_array(), view_yaw, view_pitch, fov_degrees));
-        let bob = if title || xr_head_pose.is_some() {
+        let bob = if title || self.options.vr {
             glam::Mat4::IDENTITY
         } else {
             self.bob_matrix(camera_alpha as f32)
         };
-        let spin = if title || xr_head_pose.is_some() {
+        let spin = if title || self.options.vr {
             glam::Mat4::IDENTITY
         } else {
             self.spinning_matrix(camera_alpha as f32)

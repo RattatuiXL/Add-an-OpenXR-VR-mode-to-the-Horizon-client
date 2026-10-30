@@ -667,7 +667,8 @@ impl XrSession {
         let right_stick = self.right_stick.state(&self.session, self.right_hand)?;
         let recenter = self.recenter_action.state(&self.session, self.left_hand)?;
         let recenter_down = recenter.is_active && recenter.current_state;
-        if recenter_down && !self.recenter_down {
+        let recenter_pressed = recenter_down && !self.recenter_down;
+        if recenter_pressed {
             self.anchor = None;
         }
         self.recenter_down = recenter_down;
@@ -694,7 +695,7 @@ impl XrSession {
             } else {
                 [0.0; 2]
             },
-            recenter: recenter_down,
+            recenter: recenter_pressed,
         })
     }
 
