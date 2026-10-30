@@ -21,6 +21,7 @@ horizon-shaders = { path = "../horizon-shaders" }
 horizon-telemetry = { path = "../horizon-telemetry", default-features = false, features = ["live"] }
 horizon-theme = { path = "../horizon-theme" }
 horizon-threads = { path = "../horizon-threads" }
+horizon-xr = { path = "../horizon-xr" }
 horizon-world = { path = "../horizon-world" }
 ab_glyph = "0.2.32"
 bytemuck = { version = "1.24", features = ["derive"] }

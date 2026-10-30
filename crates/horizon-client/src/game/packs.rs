@@ -201,6 +201,7 @@ impl Game<'_> {
                     self.renderer.as_ref(),
                     Some(textures),
                     self.settings.horizon.api,
+                    self.options.vr,
                 )
             })
             .transpose()
