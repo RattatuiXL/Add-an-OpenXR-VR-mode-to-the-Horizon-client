@@ -10,6 +10,7 @@ use crate::{
     sprites::SpriteAnimation,
 };
 use glam::{DVec3, Mat4, Vec3, Vec4};
+pub use horizon_xr::XrInputState;
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -3682,6 +3683,9 @@ impl Renderer {
     }
     pub fn xr_head_pose(&self) -> Option<horizon_xr::XrHeadPose> {
         self.xr_head_pose
+    }
+    pub fn xr_input(&self) -> Option<horizon_xr::XrInputState> {
+        self.xr_frame.as_ref().map(|frame| frame.input)
     }
     pub fn render(&mut self, frame: &Frame) -> Result<bool> {
         let rendered = if self.xr_session.is_some() {

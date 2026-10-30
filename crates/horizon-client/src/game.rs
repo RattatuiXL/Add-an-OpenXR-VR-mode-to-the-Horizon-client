@@ -1484,6 +1484,10 @@ struct Game<'a> {
     /// The game mode; `creative` mirrors `mode == Creative`.
     mode: horizon_client::command::args::GameMode,
     keys: HashSet<KeyCode>,
+    xr_keys: HashSet<KeyCode>,
+    xr_left_select: bool,
+    xr_right_select: bool,
+    xr_turn_ready: bool,
     // Physical input is separate from remapped and toggled movement keys.
     physical_keys: HashSet<KeyCode>,
     left: bool,
@@ -2094,6 +2098,56 @@ impl Game<'_> {
                 (self.yaw, self.pitch)
             };
         Some((eye, view_vector(yaw, pitch)))
+    }
+    fn set_xr_key(&mut self, key: KeyCode, down: bool) {
+        if down {
+            self.xr_keys.insert(key);
+        } else {
+            self.xr_keys.remove(&key);
+        }
+        if self.xr_keys.contains(&key) || self.physical_keys.contains(&key) {
+            self.keys.insert(key);
+        } else {
+            self.keys.remove(&key);
+        }
+    }
+    fn apply_xr_input(&mut self, input: horizon_client::gfx::XrInputState) -> Result<()> {
+        let playing = self.screen == Screen::Playing
+            && self.title.is_none()
+            && self.pending_entry.is_none()
+            && self.world_loader.is_none();
+        let move_key = |x: f32, y: f32| {
+            [
+                (KeyCode::KeyW, y > 0.25),
+                (KeyCode::KeyS, y < -0.25),
+                (KeyCode::KeyA, x < -0.25),
+                (KeyCode::KeyD, x > 0.25),
+            ]
+        };
+        for (key, down) in move_key(input.left_stick[0], input.left_stick[1]) {
+            self.set_xr_key(key, playing && down);
+        }
+
+        let left_select = playing && input.left_select;
+        if left_select != self.xr_left_select {
+            self.play_mouse(MouseButton::Left, left_select)?;
+            self.xr_left_select = left_select;
+        }
+        let right_select = playing && input.right_select;
+        if right_select != self.xr_right_select {
+            self.play_mouse(MouseButton::Right, right_select)?;
+            self.xr_right_select = right_select;
+        }
+
+        let turn = input.right_stick[0];
+        if turn.abs() < 0.25 {
+            self.xr_turn_ready = true;
+        } else if playing && self.xr_turn_ready && turn.abs() > 0.75 {
+            // Snap turns reduce continuous camera motion for seated and standing play.
+            self.yaw += if turn > 0.0 { -30.0 } else { 30.0 };
+            self.xr_turn_ready = false;
+        }
+        Ok(())
     }
     fn reach(&self) -> f64 {
         if self.creative { 5.0 } else { 4.5 }
@@ -5722,7 +5776,9 @@ impl Game<'_> {
                 return Ok(());
             }
         } else if !pressed {
-            self.keys.remove(&key);
+            if !self.xr_keys.contains(&key) {
+                self.keys.remove(&key);
+            }
             return Ok(());
         } else {
             self.keys.insert(key);
@@ -11779,6 +11835,14 @@ impl Game<'_> {
             .map(Renderer::prepare_xr_frame)
             .transpose()?
             .flatten();
+        if self.options.vr {
+            let input = self
+                .renderer
+                .as_ref()
+                .and_then(Renderer::xr_input)
+                .unwrap_or_default();
+            self.apply_xr_input(input)?;
+        }
         let alpha = self.clock.fraction();
         // Camera.getCameraEntityPartialTicks: the view, the hand and the
         // player's own model stay smooth while the level is frozen.
@@ -11817,7 +11881,11 @@ impl Game<'_> {
         } else {
             (view_yaw, view_pitch)
         };
-        let (view_yaw, view_pitch) = self.shaken_view(view_yaw, view_pitch);
+        let (view_yaw, view_pitch) = if xr_head_pose.is_some() {
+            (view_yaw, view_pitch)
+        } else {
+            self.shaken_view(view_yaw, view_pitch)
+        };
         self.audio
             .set_listener([camera.x, camera.y, camera.z], view_yaw, view_pitch);
         let block = [
@@ -11987,12 +12055,12 @@ impl Game<'_> {
         };
         self.locator_camera =
             (!title).then_some((camera.to_array(), view_yaw, view_pitch, fov_degrees));
-        let bob = if title {
+        let bob = if title || xr_head_pose.is_some() {
             glam::Mat4::IDENTITY
         } else {
             self.bob_matrix(camera_alpha as f32)
         };
-        let spin = if title {
+        let spin = if title || xr_head_pose.is_some() {
             glam::Mat4::IDENTITY
         } else {
             self.spinning_matrix(camera_alpha as f32)
@@ -13001,7 +13069,7 @@ impl ApplicationHandler for Game<'_> {
                 }
                 WindowEvent::Focused(focused) => {
                     self.focused = focused;
-                    if !focused && self.control.is_none() {
+                    if !focused && self.control.is_none() && !self.options.vr {
                         self.keys.clear();
                         self.left = false;
                         self.right = false;
@@ -14020,6 +14088,10 @@ impl<'a> Game<'a> {
                 horizon_client::command::args::GameMode::Survival
             },
             keys: HashSet::new(),
+            xr_keys: HashSet::new(),
+            xr_left_select: false,
+            xr_right_select: false,
+            xr_turn_ready: true,
             physical_keys: HashSet::new(),
             left: false,
             right: false,

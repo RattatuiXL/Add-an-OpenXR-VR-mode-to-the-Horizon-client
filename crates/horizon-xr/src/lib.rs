@@ -231,6 +231,127 @@ impl XrGraphics {
                 },
             )?
         };
+        let left_hand = self.xr_instance.string_to_path("/user/hand/left")?;
+        let right_hand = self.xr_instance.string_to_path("/user/hand/right")?;
+        let action_set = self
+            .xr_instance
+            .create_action_set("gameplay", "Horizon gameplay", 0)?;
+        let left_grip = action_set.create_action::<xr::Posef>(
+            "left_grip",
+            "Left controller pose",
+            &[left_hand],
+        )?;
+        let right_grip = action_set.create_action::<xr::Posef>(
+            "right_grip",
+            "Right controller pose",
+            &[right_hand],
+        )?;
+        let left_select = action_set.create_action::<bool>(
+            "left_select",
+            "Left controller select",
+            &[left_hand],
+        )?;
+        let right_select = action_set.create_action::<bool>(
+            "right_select",
+            "Right controller select",
+            &[right_hand],
+        )?;
+        let left_stick = action_set.create_action::<xr::Vector2f>(
+            "left_stick",
+            "Left controller movement",
+            &[left_hand],
+        )?;
+        let right_stick = action_set.create_action::<xr::Vector2f>(
+            "right_stick",
+            "Right controller turning",
+            &[right_hand],
+        )?;
+        let recenter_action =
+            action_set.create_action::<bool>("recenter", "Recenter headset", &[left_hand])?;
+        let path = |component: &str| self.xr_instance.string_to_path(component);
+        let simple_bindings = [
+            xr::Binding::new(&left_grip, path("/user/hand/left/input/grip/pose")?),
+            xr::Binding::new(&right_grip, path("/user/hand/right/input/grip/pose")?),
+            xr::Binding::new(&left_select, path("/user/hand/left/input/select/click")?),
+            xr::Binding::new(&right_select, path("/user/hand/right/input/select/click")?),
+            xr::Binding::new(&recenter_action, path("/user/hand/left/input/menu/click")?),
+        ];
+        let touch_bindings = [
+            xr::Binding::new(&left_grip, path("/user/hand/left/input/grip/pose")?),
+            xr::Binding::new(&right_grip, path("/user/hand/right/input/grip/pose")?),
+            xr::Binding::new(&left_select, path("/user/hand/left/input/trigger/value")?),
+            xr::Binding::new(&right_select, path("/user/hand/right/input/trigger/value")?),
+            xr::Binding::new(&left_stick, path("/user/hand/left/input/thumbstick")?),
+            xr::Binding::new(&right_stick, path("/user/hand/right/input/thumbstick")?),
+            xr::Binding::new(
+                &recenter_action,
+                path("/user/hand/left/input/thumbstick/click")?,
+            ),
+        ];
+        let index_bindings = [
+            xr::Binding::new(&left_grip, path("/user/hand/left/input/grip/pose")?),
+            xr::Binding::new(&right_grip, path("/user/hand/right/input/grip/pose")?),
+            xr::Binding::new(&left_select, path("/user/hand/left/input/trigger/click")?),
+            xr::Binding::new(&right_select, path("/user/hand/right/input/trigger/click")?),
+            xr::Binding::new(&left_stick, path("/user/hand/left/input/thumbstick")?),
+            xr::Binding::new(&right_stick, path("/user/hand/right/input/thumbstick")?),
+            xr::Binding::new(
+                &recenter_action,
+                path("/user/hand/left/input/thumbstick/click")?,
+            ),
+        ];
+        let vive_bindings = [
+            xr::Binding::new(&left_grip, path("/user/hand/left/input/grip/pose")?),
+            xr::Binding::new(&right_grip, path("/user/hand/right/input/grip/pose")?),
+            xr::Binding::new(&left_select, path("/user/hand/left/input/trigger/click")?),
+            xr::Binding::new(&right_select, path("/user/hand/right/input/trigger/click")?),
+            xr::Binding::new(&left_stick, path("/user/hand/left/input/trackpad")?),
+            xr::Binding::new(&right_stick, path("/user/hand/right/input/trackpad")?),
+            xr::Binding::new(&recenter_action, path("/user/hand/left/input/menu/click")?),
+        ];
+        let mixed_reality_bindings = [
+            xr::Binding::new(&left_grip, path("/user/hand/left/input/grip/pose")?),
+            xr::Binding::new(&right_grip, path("/user/hand/right/input/grip/pose")?),
+            xr::Binding::new(&left_select, path("/user/hand/left/input/trigger/value")?),
+            xr::Binding::new(&right_select, path("/user/hand/right/input/trigger/value")?),
+            xr::Binding::new(&left_stick, path("/user/hand/left/input/thumbstick")?),
+            xr::Binding::new(&right_stick, path("/user/hand/right/input/thumbstick")?),
+            xr::Binding::new(&recenter_action, path("/user/hand/left/input/menu/click")?),
+        ];
+        for (profile, bindings) in [
+            (
+                "/interaction_profiles/khr/simple_controller",
+                simple_bindings.as_slice(),
+            ),
+            (
+                "/interaction_profiles/oculus/touch_controller",
+                touch_bindings.as_slice(),
+            ),
+            (
+                "/interaction_profiles/valve/index_controller",
+                index_bindings.as_slice(),
+            ),
+            (
+                "/interaction_profiles/htc/vive_controller",
+                vive_bindings.as_slice(),
+            ),
+            (
+                "/interaction_profiles/microsoft/motion_controller",
+                mixed_reality_bindings.as_slice(),
+            ),
+        ] {
+            if let Ok(profile) = path(profile) {
+                // Each runtime accepts only profiles and components it knows.
+                let _ = self
+                    .xr_instance
+                    .suggest_interaction_profile_bindings(profile, bindings);
+            }
+        }
+        session.attach_action_sets(&[&action_set])?;
+        let left_controller_space =
+            left_grip.create_space(&session, left_hand, xr::Posef::IDENTITY)?;
+        let right_controller_space =
+            right_grip.create_space(&session, right_hand, xr::Posef::IDENTITY)?;
         let reference_space =
             session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)?;
 
@@ -291,18 +412,32 @@ impl XrGraphics {
         // here would block renderer construction before the event loop runs.
         let event_buffer = xr::EventDataBuffer::new();
         Ok(XrSession {
-            instance: self.xr_instance.clone(),
-            session,
+            swapchain,
+            reference_space,
+            left_hand,
+            right_hand,
+            left_controller_space,
+            right_controller_space,
+            left_grip,
+            right_grip,
+            left_select,
+            right_select,
+            left_stick,
+            right_stick,
+            recenter_action,
+            action_set,
             frame_waiter,
             frame_stream,
-            reference_space,
-            swapchain,
+            session,
+            instance: self.xr_instance.clone(),
             event_buffer,
             size,
             format: texture_format,
             blend_mode,
             session_running: false,
+            session_focused: false,
             anchor: None,
+            recenter_down: false,
         })
     }
 }
@@ -312,6 +447,18 @@ pub struct XrSession {
     // Runtime-owned children must be destroyed before their parent session.
     swapchain: xr::Swapchain<xr::Vulkan>,
     reference_space: xr::Space,
+    left_hand: xr::Path,
+    right_hand: xr::Path,
+    left_controller_space: xr::Space,
+    right_controller_space: xr::Space,
+    left_grip: xr::Action<xr::Posef>,
+    right_grip: xr::Action<xr::Posef>,
+    left_select: xr::Action<bool>,
+    right_select: xr::Action<bool>,
+    left_stick: xr::Action<xr::Vector2f>,
+    right_stick: xr::Action<xr::Vector2f>,
+    recenter_action: xr::Action<bool>,
+    action_set: xr::ActionSet,
     frame_waiter: xr::FrameWaiter,
     frame_stream: xr::FrameStream<xr::Vulkan>,
     session: xr::Session<xr::Vulkan>,
@@ -321,7 +468,9 @@ pub struct XrSession {
     format: wgpu::TextureFormat,
     blend_mode: xr::EnvironmentBlendMode,
     session_running: bool,
+    session_focused: bool,
     anchor: Option<(glam::Vec3, glam::Quat)>,
+    recenter_down: bool,
 }
 
 /// Tracking and display timing for one OpenXR frame.
@@ -330,7 +479,28 @@ pub struct XrFrame {
     pub tracking_valid: bool,
     pub views: [xr::View; 2],
     pub image_index: Option<u32>,
+    pub input: XrInputState,
     predicted_display_time: xr::Time,
+}
+
+/// Standard controller input sampled at the OpenXR predicted display time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct XrInputState {
+    pub left_controller: Option<XrControllerPose>,
+    pub right_controller: Option<XrControllerPose>,
+    pub left_select: bool,
+    pub right_select: bool,
+    pub left_stick: [f32; 2],
+    pub right_stick: [f32; 2],
+    /// Rising edge recenters the tracked head relative to the game camera.
+    pub recenter: bool,
+}
+
+/// A tracked controller grip pose in the OpenXR reference space.
+#[derive(Clone, Copy, Debug)]
+pub struct XrControllerPose {
+    pub translation: glam::Vec3,
+    pub rotation: glam::Quat,
 }
 
 /// One OpenXR eye's view and asymmetric projection matrices.
@@ -473,26 +643,84 @@ impl XrSession {
             .collect()
     }
 
+    fn sync_input(&mut self, time: xr::Time) -> Result<XrInputState> {
+        if !self.session_focused {
+            return Ok(XrInputState::default());
+        }
+        self.session.sync_actions(&[(&self.action_set).into()])?;
+        let pose = |space: &xr::Space| -> Result<Option<XrControllerPose>> {
+            let location = space.locate(&self.reference_space, time)?;
+            let valid =
+                xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
+            if !location.location_flags.contains(valid) {
+                return Ok(None);
+            }
+            let p = location.pose.position;
+            Ok(Some(XrControllerPose {
+                translation: glam::Vec3::new(p.x, p.y, p.z),
+                rotation: quat(location.pose.orientation),
+            }))
+        };
+        let left_select = self.left_select.state(&self.session, self.left_hand)?;
+        let right_select = self.right_select.state(&self.session, self.right_hand)?;
+        let left_stick = self.left_stick.state(&self.session, self.left_hand)?;
+        let right_stick = self.right_stick.state(&self.session, self.right_hand)?;
+        let recenter = self.recenter_action.state(&self.session, self.left_hand)?;
+        let recenter_down = recenter.is_active && recenter.current_state;
+        if recenter_down && !self.recenter_down {
+            self.anchor = None;
+        }
+        self.recenter_down = recenter_down;
+        Ok(XrInputState {
+            left_controller: if self.left_grip.is_active(&self.session, self.left_hand)? {
+                pose(&self.left_controller_space)?
+            } else {
+                None
+            },
+            right_controller: if self.right_grip.is_active(&self.session, self.right_hand)? {
+                pose(&self.right_controller_space)?
+            } else {
+                None
+            },
+            left_select: left_select.is_active && left_select.current_state,
+            right_select: right_select.is_active && right_select.current_state,
+            left_stick: if left_stick.is_active {
+                [left_stick.current_state.x, left_stick.current_state.y]
+            } else {
+                [0.0; 2]
+            },
+            right_stick: if right_stick.is_active {
+                [right_stick.current_state.x, right_stick.current_state.y]
+            } else {
+                [0.0; 2]
+            },
+            recenter: recenter_down,
+        })
+    }
+
     /// Begins a frame when the runtime has put the session in the READY state.
     pub fn begin_frame(&mut self) -> Result<Option<XrFrame>> {
         while let Some(event) = self.instance.poll_event(&mut self.event_buffer)? {
             match event {
-                xr::Event::SessionStateChanged(event) => match event.state() {
-                    xr::SessionState::READY if !self.session_running => {
-                        self.session
-                            .begin(xr::ViewConfigurationType::PRIMARY_STEREO)?;
-                        self.session_running = true;
+                xr::Event::SessionStateChanged(event) => {
+                    self.session_focused = event.state() == xr::SessionState::FOCUSED;
+                    match event.state() {
+                        xr::SessionState::READY if !self.session_running => {
+                            self.session
+                                .begin(xr::ViewConfigurationType::PRIMARY_STEREO)?;
+                            self.session_running = true;
+                        }
+                        xr::SessionState::STOPPING if self.session_running => {
+                            self.session.end()?;
+                            self.session_running = false;
+                        }
+                        xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                            self.session_running = false;
+                            return Ok(None);
+                        }
+                        _ => {}
                     }
-                    xr::SessionState::STOPPING if self.session_running => {
-                        self.session.end()?;
-                        self.session_running = false;
-                    }
-                    xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
-                        self.session_running = false;
-                        return Ok(None);
-                    }
-                    _ => {}
-                },
+                }
                 xr::Event::InstanceLossPending(_) => {
                     self.session_running = false;
                     return Ok(None);
@@ -506,12 +734,14 @@ impl XrSession {
 
         let state = self.frame_waiter.wait()?;
         self.frame_stream.begin()?;
+        let input = self.sync_input(state.predicted_display_time)?;
         if !state.should_render {
             return Ok(Some(XrFrame {
                 should_render: false,
                 tracking_valid: false,
                 views: [xr::View::default(); 2],
                 image_index: None,
+                input,
                 predicted_display_time: state.predicted_display_time,
             }));
         }
@@ -531,6 +761,7 @@ impl XrSession {
                 && view_flags.contains(xr::ViewStateFlags::POSITION_VALID),
             views: [views[0], views[1]],
             image_index: Some(image_index),
+            input,
             predicted_display_time: state.predicted_display_time,
         }))
     }
